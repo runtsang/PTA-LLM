@@ -5,9 +5,11 @@ import logging
 import os
 import sys
 from typing import Dict, List
+import copy
 
 import editdistance
 import numpy as np
+import json
 import torch
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -510,6 +512,283 @@ def transform_step_logits(
         aligned_blending_model_per_step_logits.append(
             aligned_blending_model_per_step_logit
         )
+    return (
+        aligned_blending_model_per_step_logits,
+        aligned_blending_model_per_step_indices,
+    )
+
+def compute_optimal_transport(M, r, c, lam, epsilon=1e-5):
+    """
+    Computes the optimal transport matrix and Slinkhorn distance using the
+    Sinkhorn-Knopp algorithm
+
+    Inputs:
+        - M : cost matrix (n x m)
+        - r : vector of marginals (n, )
+        - c : vector of marginals (m, )
+        - lam : strength of the entropic regularization
+        - epsilon : convergence parameter
+
+    Output:
+        - P : optimal transport matrix (n x m)
+        - dist : Sinkhorn distance
+    """
+    n, m = M.shape
+    P = np.exp(- lam * M)
+    P /= P.sum()
+    u = np.zeros(n)
+    
+    small_value = 1e-10  
+    
+    # normalize this matrix
+    while np.max(np.abs(u - P.sum(1))) > epsilon:
+        u = P.sum(1)
+        u[u < small_value] = small_value  
+        P *= (r / u).reshape((-1, 1))
+        
+        v = P.sum(0)
+        v[v < small_value] = small_value  
+        P *= (c / v).reshape((1, -1))
+    # print(P, np.sum(P * M))
+    return P, np.sum(P * M)
+
+
+def return_pair(arr):
+    max_indices = np.argmax(arr, axis=1)
+    max_values = np.max(arr, axis=1)
+
+    result = list(zip(max_indices, max_values))
+
+    return result
+
+def merge_lists(a, b):
+    merged_dict = {}
+    
+    for key, value in zip(a, b):
+        if key in merged_dict:
+            merged_dict[key] += value
+        else:
+            merged_dict[key] = value
+    
+    keys = list(merged_dict.keys())
+    values = list(merged_dict.values())
+    
+    return keys, values
+
+def transform_step_logits_ot(
+    base_model_tokenizer: transformers.tokenization_utils_base.PreTrainedTokenizerBase,
+    blending_model_tokenizer: transformers.tokenization_utils_base.PreTrainedTokenizerBase,
+    base_model_vocab: Dict[str, int],
+    base_model_input_ids: List[int],
+    blending_model_input_ids: List[int],
+    blending_model_per_step_logits: List[List[float]],
+    base_model_per_step_logits: List[List[float]],
+    base_model_per_step_indices: List[List[int]],
+    blending_model_per_step_indices: List[List[int]],
+    vocab_align_type: str = "hard",
+    blending_to_base_mapping: Dict[str, str] = None,
+    epsilon_input = 1e-5,
+    logits_number = 10
+):
+    """Align blending model per step logits & indices with base model."""
+    base_model_tokens = base_model_tokenizer.convert_ids_to_tokens(base_model_input_ids)
+    blending_model_tokens = blending_model_tokenizer.convert_ids_to_tokens(
+        blending_model_input_ids
+    )
+    base_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[
+        base_model_tokenizer.__class__
+    ]
+    blending_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[
+        blending_model_tokenizer.__class__
+    ]
+    
+        
+    from scipy.special import softmax
+    def dist_fn(a, b):
+        """Calculate editdistance between two tokens, a is from blending model, b is from base model."""
+        aa = a.replace(blending_model_special_token, "")
+        bb = b.replace(base_model_special_token, "")
+        dist = editdistance.eval(aa, bb)
+        return dist
+
+    _, _, _, base_to_blending, _ = dtw(
+        blending_model_tokens, base_model_tokens, norm_func=dist_fn
+    )
+    aligned_blending_model_per_step_logits, aligned_blending_model_per_step_indices = (
+        [],
+        [],
+    )
+    for i, blending_idx in enumerate(base_to_blending):
+        aligned_blending_model_per_step_logit = []
+        aligned_blending_model_per_step_index = []
+        if len(blending_idx) == 1:  # one base token map to one blending token
+            j = blending_idx[0]
+            base_token = base_model_tokens[i]
+            blending_token = blending_model_tokens[j].replace(
+                blending_model_special_token, base_model_special_token
+            )
+            if (
+                (
+                    blending_model_tokenizer.__class__
+                    == transformers.GPTNeoXTokenizerFast
+                    or blending_model_tokenizer.__class__
+                    == transformers.GPT2TokenizerFast
+                )
+                and i == 0
+                and base_token.startswith(base_model_special_token)
+                and not blending_token.startswith(base_model_special_token)
+            ):
+                blending_token = (
+                    base_model_special_token + blending_token
+                )  # special case for mpt
+            
+            # if len(ot_list) <= 100:
+            tmp = dict()
+                                
+            tmp["base_token"] = base_token
+            tmp["blending_token"] = blending_token
+
+            tmp["base_logit"] = softmax(base_model_per_step_logits[i])
+            tmp["base_indice"] = base_model_per_step_indices[i]
+            tmp["base_tokens"] = base_model_tokenizer.convert_ids_to_tokens(base_model_per_step_indices[i])
+            
+            if vocab_align_type == "hard":
+                if (
+                    base_token == blending_token
+                ):  # find the aligned mapping, use the corresponding logits
+                    # the logits and indices at this step
+                    for blending_logit, blending_index in zip(
+                        blending_model_per_step_logits[j],
+                        blending_model_per_step_indices[j],
+                    ):
+                        # the token corresponds to the logit and indices
+                        blending_t = blending_model_tokenizer.convert_ids_to_tokens(
+                            [blending_index]
+                        )[0].replace(
+                            blending_model_special_token, base_model_special_token
+                        )
+                        if blending_t in base_model_vocab:
+                            aligned_index = base_model_vocab[
+                                blending_t
+                            ]  # the index of the token in base model vocab
+                            if (
+                                aligned_index
+                                not in aligned_blending_model_per_step_index
+                            ):
+                                aligned_blending_model_per_step_index.append(
+                                    aligned_index
+                                )
+                                aligned_blending_model_per_step_logit.append(
+                                    blending_logit
+                                )
+                else:  # find error aligned mapping, use the one-hot logits
+                    aligned_blending_model_per_step_index.append(
+                        base_model_vocab[base_token]
+                    )
+                    aligned_blending_model_per_step_logit.append(1.0)
+            elif vocab_align_type == "soft":
+                if (base_token == blending_token) or (
+                    blending_token in blending_to_base_mapping
+                    and base_token == blending_to_base_mapping[blending_token]
+                ):  # find the aligned mapping, use the corresponding logits
+                    # the logits and indices at this step
+                    for blending_logit, blending_index in zip(
+                        blending_model_per_step_logits[j],
+                        blending_model_per_step_indices[j],
+                    ):
+                        # the token corresponds to the logit and indices
+                        blending_t = blending_model_tokenizer.convert_ids_to_tokens(
+                            [blending_index]
+                        )[0].replace(
+                            blending_model_special_token, base_model_special_token
+                        )
+                        blending_tt = blending_to_base_mapping[blending_t]
+                        if blending_tt in base_model_vocab:
+                            aligned_index = base_model_vocab[
+                                blending_tt
+                            ]  # the index of the token in base model vocab
+                            if (
+                                aligned_index
+                                not in aligned_blending_model_per_step_index
+                            ):
+                                aligned_blending_model_per_step_index.append(
+                                    aligned_index
+                                )
+                                aligned_blending_model_per_step_logit.append(
+                                    blending_logit
+                                )
+                                
+                                
+                        else:
+                            logger.warning(
+                                f"blending_t: {blending_t} not in base_model_vocab!"
+                            )
+                    
+                    # if len(ot_list) <= 100:
+                    tmp["blending_logit"] = softmax(blending_model_per_step_logits[j])
+                    tmp["blending_indice"] = copy.deepcopy(aligned_blending_model_per_step_index)
+                    tmp["blending_tokens"] = base_model_tokenizer.convert_ids_to_tokens(copy.deepcopy(aligned_blending_model_per_step_index))
+                    
+                    tmp["cost_matrix"] = np.empty((logits_number, logits_number))
+                    if len(tmp["blending_tokens"]) >= logits_number and len(tmp["base_tokens"]) >= logits_number:
+                        for i in range(logits_number):
+                            for j in range(logits_number):
+                                tmp["cost_matrix"][i][j] = dist_fn(tmp["blending_tokens"][i], tmp["base_tokens"][j])
+                                
+                        # print(np.array(tmp["blending_logit"]), np.array(tmp["base_logit"]))
+                        tmp["P"], tmp["dist"] = compute_optimal_transport(tmp["cost_matrix"], np.array(tmp["blending_logit"][:logits_number]), np.array(tmp["base_logit"][:logits_number]), lam=30, epsilon=epsilon_input)
+                        
+                        tmp["our_indice"], tmp["our_token"], tmp["our_logit"] = [], [], []
+
+                        ours = return_pair(tmp["P"])
+                        for max_indices, max_values in ours:
+                            tmp["our_indice"].append(tmp["base_indice"][max_indices])
+                            tmp["our_token"].append(tmp["base_tokens"][max_indices])
+                            tmp["our_logit"].append(max_values)
+
+                        tmp_logit = copy.deepcopy(tmp["our_logit"])
+                            
+                        tmp["our_token"], tmp["our_logit"] = merge_lists(tmp["our_token"], tmp["our_logit"])
+                        tmp["our_indice"], _ = merge_lists(tmp["our_indice"], tmp_logit)
+                        
+                        our_logit = copy.deepcopy(tmp["our_logit"])
+                        
+                        tmp["our_logit"] = list(str(tmp["our_logit"][i]) for i in range(len(tmp["our_logit"])))
+                        tmp["blending_logit"] = list(str(tmp["blending_logit"][i]) for i in range(10))
+                        tmp["base_logit"] = list(str(tmp["base_logit"][i]) for i in range(10))
+                        
+                        tmp["cost_matrix"] = tmp["cost_matrix"].astype(str).tolist()
+                        tmp["P"] = tmp["P"].astype(str).tolist()
+                        
+                        has_nan = any(np.isnan(x) for x in our_logit)
+                        has_negative = any(x < 0 for x in our_logit if not np.isnan(x))
+                        if not has_nan and not has_negative:
+                            aligned_blending_model_per_step_index = copy.deepcopy(tmp["our_indice"])
+                            aligned_blending_model_per_step_logit = copy.deepcopy(our_logit)
+                            
+                        # ot_list.append(tmp)
+                else:  # find error aligned mapping, use the one-hot logits
+                    aligned_blending_model_per_step_index.append(
+                        base_model_vocab[base_token]
+                    )
+                    aligned_blending_model_per_step_logit.append(1.0)
+            else:
+                logger.warning(
+                    f"The vocab_align_type: '{vocab_align_type}' is not support!"
+                )
+                raise NotImplementedError
+        else:  # one base token map to multiple blending token, in this case only fit base token. use the one-hot logits
+            base_token = base_model_tokens[i]
+            aligned_blending_model_per_step_index.append(base_model_vocab[base_token])
+            aligned_blending_model_per_step_logit.append(1.0)
+        aligned_blending_model_per_step_indices.append(
+            aligned_blending_model_per_step_index
+        )
+        aligned_blending_model_per_step_logits.append(
+            aligned_blending_model_per_step_logit
+        )
+
+        
     return (
         aligned_blending_model_per_step_logits,
         aligned_blending_model_per_step_indices,
