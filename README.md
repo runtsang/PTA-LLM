@@ -4,7 +4,7 @@
 
 **Contact me:** [runjia.tech](https://runjia.tech/) | rz4545@rit.edu | runjia@msn.com
 
-Paper | [Homepage](https://runjia.tech/neurips_pta-llm/)
+[Paper](https://arxiv.org/abs/2509.17276) | [Homepage](https://runjia.tech/neurips_pta-llm/)
 
 # 📣News
 
