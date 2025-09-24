@@ -14,6 +14,10 @@
 
 **2025/09/21:** Our code is publicly available now! Thank you for your attention and patience!
 
+#  📰Poster
+
+![image](https://github.com/runtsang/PTA-LLM/blob/master/imgs/poster.jpg)
+
 ## Data Construction
 
 We use the [MiniPile](https://huggingface.co/datasets/JeanKaddour/minipile) dataset for continual training. 
